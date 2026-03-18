@@ -23,6 +23,7 @@ const STATE_FILE = process.env.CHECKIN_STATE_FILE || "C:/Users/keving/.claude-re
 interface CheckinState {
   lastCheckinTime: string;
   lastMessageTime: string;
+  dismissedDate?: string; // YYYY-MM-DD — skip check-ins for the rest of this day
 }
 
 async function loadState(): Promise<CheckinState> {
@@ -49,7 +50,18 @@ async function sendTelegram(message: string): Promise<boolean> {
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: CHAT_ID, text: message }),
+        body: JSON.stringify({
+          chat_id: CHAT_ID,
+          text: message,
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "Snooze 2h", callback_data: "checkin:snooze" },
+                { text: "Dismiss for today", callback_data: "checkin:dismiss" },
+              ],
+            ],
+          },
+        }),
       }
     );
     return response.ok;
@@ -131,6 +143,14 @@ async function main() {
   const sastHour = new Date().getUTCHours() + 2;
   if (sastHour < 9 || sastHour >= 18) {
     console.log(`Outside active hours (SAST ${sastHour}:xx) — skipping`);
+    process.exit(0);
+  }
+
+  // Skip if already dismissed for today
+  const state = await loadState();
+  const today = new Date().toISOString().split("T")[0];
+  if (state.dismissedDate === today) {
+    console.log("Check-in dismissed for today — skipping");
     process.exit(0);
   }
 

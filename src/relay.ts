@@ -18,6 +18,14 @@ import {
   getMemoryContext,
   getRelevantContext,
 } from "./memory.ts";
+import {
+  parseActionIntents,
+  buildInlineKeyboard,
+  executeAction,
+  cleanupExpiredActions,
+  type ParsedAction,
+  type PendingAction,
+} from "./actions.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -162,6 +170,22 @@ if (!(await acquireLock())) {
 
 const bot = new Bot(BOT_TOKEN);
 
+const pendingActions = new Map<number, PendingAction>();
+const ACTION_EXPIRY_MS = 30 * 60 * 1000;
+const startTime = Date.now();
+
+// Tracks recent bot message_id → content snippet for reaction lookup
+const recentMessages = new Map<number, string>();
+const RECENT_MESSAGES_MAX = 50;
+
+// Register commands in Telegram's / autocomplete menu
+await bot.api.setMyCommands([
+  { command: "goals",  description: "List your active goals" },
+  { command: "memory", description: "List saved facts" },
+  { command: "clear",  description: "Reset conversation session" },
+  { command: "status", description: "Bot health check" },
+]);
+
 // ============================================================
 // SECURITY: Only respond to authorized user
 // ============================================================
@@ -235,12 +259,85 @@ async function callClaude(
 }
 
 // ============================================================
+// SLASH COMMANDS
+// ============================================================
+
+bot.command("goals", async (ctx) => {
+  if (!supabase) {
+    await ctx.reply("Supabase is not configured — goals are not available.");
+    return;
+  }
+  const { data } = await supabase.rpc("get_active_goals");
+  if (!data?.length) {
+    await ctx.reply("No active goals.");
+    return;
+  }
+  const lines = data.map((g: { content: string; deadline?: string }) => {
+    const deadline = g.deadline
+      ? ` (by ${new Date(g.deadline).toLocaleDateString()})`
+      : "";
+    return `• ${g.content}${deadline}`;
+  });
+  await ctx.reply(`🎯 Active Goals\n\n${lines.join("\n")}`);
+});
+
+bot.command("memory", async (ctx) => {
+  if (!supabase) {
+    await ctx.reply("Supabase is not configured — memory is not available.");
+    return;
+  }
+  const { data } = await supabase.rpc("get_facts");
+  if (!data?.length) {
+    await ctx.reply("No facts saved yet.");
+    return;
+  }
+  const lines = data.map((f: { content: string }) => `• ${f.content}`);
+  await ctx.reply(`🧠 Saved Facts\n\n${lines.join("\n")}`);
+});
+
+bot.command("clear", async (ctx) => {
+  session.sessionId = null;
+  session.lastActivity = new Date().toISOString();
+  await saveSession(session);
+  await ctx.reply("🔄 Conversation cleared. Next message starts fresh.");
+});
+
+bot.command("status", async (ctx) => {
+  const supabaseStatus = supabase ? "✅ connected" : "❌ not configured";
+  const voiceStatus = process.env.VOICE_PROVIDER
+    ? `✅ ${process.env.VOICE_PROVIDER}`
+    : "❌ not configured";
+  const sessionStatus = session.sessionId
+    ? `active (${session.sessionId.substring(0, 8)}...)`
+    : "none";
+  const uptimeMs = Date.now() - startTime;
+  const uptimeH = Math.floor(uptimeMs / 3600000);
+  const uptimeM = Math.floor((uptimeMs % 3600000) / 60000);
+  const uptimeStr = uptimeH > 0 ? `${uptimeH}h ${uptimeM}m` : `${uptimeM}m`;
+
+  await ctx.reply(
+    `✅ Bot: online\n` +
+    `🗄️ Supabase: ${supabaseStatus}\n` +
+    `🎤 Voice: ${voiceStatus}\n` +
+    `🔑 Session: ${sessionStatus}\n` +
+    `⏱️ Uptime: ${uptimeStr}`
+  );
+});
+
+// ============================================================
 // MESSAGE HANDLERS
 // ============================================================
 
 // Text messages
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
+
+  // Unknown slash command — don't send to Claude
+  if (text.startsWith("/")) {
+    await ctx.reply("Unknown command. Type / to see available commands.");
+    return;
+  }
+
   console.log(`Message: ${text.substring(0, 50)}...`);
 
   await ctx.replyWithChatAction("typing");
@@ -256,11 +353,12 @@ bot.on("message:text", async (ctx) => {
   const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext);
   const rawResponse = await callClaude(enrichedPrompt, { resume: true });
 
-  // Parse and save any memory intents, strip tags from response
-  const response = await processMemoryIntents(supabase, rawResponse);
+  // Parse and save any memory intents, then extract action intents
+  const memoryProcessed = await processMemoryIntents(supabase, rawResponse);
+  const { clean: response, action } = parseActionIntents(memoryProcessed);
 
   await saveMessage("assistant", response);
-  await sendResponse(ctx, response);
+  await sendResponse(ctx, response, action ?? undefined);
 });
 
 // Voice messages
@@ -302,10 +400,11 @@ bot.on("message:voice", async (ctx) => {
       memoryContext
     );
     const rawResponse = await callClaude(enrichedPrompt, { resume: true });
-    const claudeResponse = await processMemoryIntents(supabase, rawResponse);
+    const memoryProcessed = await processMemoryIntents(supabase, rawResponse);
+    const { clean: claudeResponse, action } = parseActionIntents(memoryProcessed);
 
     await saveMessage("assistant", claudeResponse);
-    await sendResponse(ctx, claudeResponse);
+    await sendResponse(ctx, claudeResponse, action ?? undefined);
   } catch (error) {
     console.error("Voice error:", error);
     await ctx.reply("Could not process voice message. Check logs for details.");
@@ -344,9 +443,10 @@ bot.on("message:photo", async (ctx) => {
     // Cleanup after processing
     await unlink(filePath).catch(() => {});
 
-    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
+    const memoryProcessed = await processMemoryIntents(supabase, claudeResponse);
+    const { clean: cleanResponse, action } = parseActionIntents(memoryProcessed);
     await saveMessage("assistant", cleanResponse);
-    await sendResponse(ctx, cleanResponse);
+    await sendResponse(ctx, cleanResponse, action ?? undefined);
   } catch (error) {
     console.error("Image error:", error);
     await ctx.reply("Could not process image.");
@@ -380,9 +480,10 @@ bot.on("message:document", async (ctx) => {
 
     await unlink(filePath).catch(() => {});
 
-    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
+    const memoryProcessed = await processMemoryIntents(supabase, claudeResponse);
+    const { clean: cleanResponse, action } = parseActionIntents(memoryProcessed);
     await saveMessage("assistant", cleanResponse);
-    await sendResponse(ctx, cleanResponse);
+    await sendResponse(ctx, cleanResponse, action ?? undefined);
   } catch (error) {
     console.error("Document error:", error);
     await ctx.reply("Could not process document.");
@@ -439,21 +540,53 @@ function buildPrompt(
       "\n[DONE: search text for completed goal]"
   );
 
+  parts.push(
+    "\nACTION REQUESTS:" +
+      "\nWhen you want to take an action that requires user approval, include ONE of these tags in your response:" +
+      "\n[ACTION: confirm | text: <what you're asking>]" +
+      "\n[ACTION: save_fact | text: <description> | data: <the fact to store>]" +
+      "\n[ACTION: save_goal | text: <description> | data: <the goal text>]" +
+      "\n[ACTION: send_message | text: <description> | data: <exact message to send>]" +
+      "\nThe user will see Yes/No buttons. Use these sparingly — only for meaningful actions, never casual questions. One action per response maximum."
+  );
+
   parts.push(`\nUser: ${userMessage}`);
 
   return parts.join("\n");
 }
 
-async function sendResponse(ctx: Context, response: string): Promise<void> {
+async function sendResponse(
+  ctx: Context,
+  response: string,
+  action?: ParsedAction
+): Promise<void> {
   // Telegram has a 4096 character limit
   const MAX_LENGTH = 4000;
 
   if (response.length <= MAX_LENGTH) {
-    await ctx.reply(response);
+    const keyboard = action ? buildInlineKeyboard(action) : undefined;
+    const sent = await ctx.reply(
+      response,
+      keyboard ? { reply_markup: keyboard } : undefined
+    );
+    if (sent.message_id) {
+      recentMessages.set(sent.message_id, response.substring(0, 150));
+      if (recentMessages.size > RECENT_MESSAGES_MAX) {
+        recentMessages.delete(recentMessages.keys().next().value!);
+      }
+    }
+    if (action && sent.message_id) {
+      pendingActions.set(sent.message_id, {
+        action,
+        chatId: ctx.chat!.id,
+        createdAt: Date.now(),
+      });
+      cleanupExpiredActions(pendingActions, ACTION_EXPIRY_MS);
+    }
     return;
   }
 
-  // Split long responses
+  // Split long responses — only attach keyboard to the last chunk
   const chunks = [];
   let remaining = response;
 
@@ -463,7 +596,6 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
       break;
     }
 
-    // Try to split at a natural boundary
     let splitIndex = remaining.lastIndexOf("\n\n", MAX_LENGTH);
     if (splitIndex === -1) splitIndex = remaining.lastIndexOf("\n", MAX_LENGTH);
     if (splitIndex === -1) splitIndex = remaining.lastIndexOf(" ", MAX_LENGTH);
@@ -473,10 +605,159 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
     remaining = remaining.substring(splitIndex).trim();
   }
 
-  for (const chunk of chunks) {
-    await ctx.reply(chunk);
+  for (let i = 0; i < chunks.length; i++) {
+    const isLast = i === chunks.length - 1;
+    const keyboard = isLast && action ? buildInlineKeyboard(action) : undefined;
+    const sent = await ctx.reply(
+      chunks[i],
+      keyboard ? { reply_markup: keyboard } : undefined
+    );
+    if (sent.message_id) {
+      recentMessages.set(sent.message_id, response.substring(0, 150));
+      if (recentMessages.size > RECENT_MESSAGES_MAX) {
+        recentMessages.delete(recentMessages.keys().next().value!);
+      }
+    }
+    if (isLast && action && sent.message_id) {
+      pendingActions.set(sent.message_id, {
+        action,
+        chatId: ctx.chat!.id,
+        createdAt: Date.now(),
+      });
+      cleanupExpiredActions(pendingActions, ACTION_EXPIRY_MS);
+    }
   }
 }
+
+// ============================================================
+// REACTION HANDLER
+// ============================================================
+
+bot.on("message_reaction", async (ctx) => {
+  const reaction = ctx.messageReaction;
+  const messageId = reaction.message_id;
+
+  // Only handle reactions on bot messages (tracked in recentMessages)
+  if (!recentMessages.has(messageId)) return;
+
+  // Determine newly added reactions (ignore removals)
+  const added = reaction.new_reaction.filter(
+    (r) =>
+      !reaction.old_reaction.some(
+        (o) =>
+          o.type === r.type &&
+          (o.type === "emoji" ? (o as any).emoji === (r as any).emoji : true)
+      )
+  );
+
+  for (const r of added) {
+    if (r.type !== "emoji") continue;
+    const emoji = (r as { type: "emoji"; emoji: string }).emoji;
+
+    const sentiment =
+      ["👍", "❤️", "🔥"].includes(emoji) ? "positive" :
+      emoji === "👎" ? "negative" :
+      null;
+
+    if (!sentiment || !supabase) continue;
+
+    const snippet = recentMessages.get(messageId);
+    const content =
+      sentiment === "positive"
+        ? `User reacted ${emoji} — liked this response style${snippet ? `: "${snippet}"` : ""}`
+        : `User reacted ${emoji} — disliked this response style${snippet ? `: "${snippet}"` : ""}`;
+
+    await supabase.from("memory").insert({
+      type: "preference",
+      content,
+      metadata: { emoji, sentiment, message_id: messageId },
+    });
+
+    console.log(`Reaction ${emoji} (${sentiment}) saved on message ${messageId}`);
+  }
+});
+
+// ============================================================
+// CALLBACK QUERY HANDLER (inline button presses)
+// ============================================================
+
+const CHECKIN_STATE_FILE =
+  process.env.CHECKIN_STATE_FILE ||
+  join(process.env.HOME || "~", ".claude-relay", "checkin-state.json");
+
+bot.on("callback_query:data", async (ctx) => {
+  const data = ctx.callbackQuery.data;
+  const messageId = ctx.callbackQuery.message?.message_id;
+  const originalText = ctx.callbackQuery.message?.text || "";
+
+  // --- Smart check-in snooze / dismiss ---
+  if (data.startsWith("checkin:")) {
+    const subAction = data.split(":")[1];
+    try {
+      let state: Record<string, unknown> = {};
+      try {
+        state = JSON.parse(await readFile(CHECKIN_STATE_FILE, "utf-8"));
+      } catch {}
+
+      const now = new Date();
+      if (subAction === "snooze") {
+        state.lastCheckinTime = new Date(
+          now.getTime() + 2 * 60 * 60 * 1000
+        ).toISOString();
+      } else if (subAction === "dismiss") {
+        state.dismissedDate = now.toISOString().split("T")[0];
+      }
+
+      await writeFile(CHECKIN_STATE_FILE, JSON.stringify(state, null, 2));
+
+      const label =
+        subAction === "snooze" ? "Snoozed for 2 hours." : "Dismissed for today.";
+      await ctx.editMessageText(`${originalText}\n\n${label}`, {
+        reply_markup: undefined,
+      });
+      await ctx.answerCallbackQuery({ text: label });
+    } catch (error) {
+      console.error("Checkin callback error:", error);
+      await ctx.answerCallbackQuery({ text: "Something went wrong." });
+    }
+    return;
+  }
+
+  // --- Claude-generated action buttons ---
+  if (data === "action:yes" || data === "action:no") {
+    if (!messageId) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    const pending = pendingActions.get(messageId);
+    if (!pending) {
+      await ctx.editMessageText(`${originalText}\n\n⏱️ This action has expired.`, {
+        reply_markup: undefined,
+      });
+      await ctx.answerCallbackQuery({ text: "This action has expired." });
+      return;
+    }
+
+    pendingActions.delete(messageId);
+    const approved = data === "action:yes";
+    const result = await executeAction(
+      supabase,
+      BOT_TOKEN,
+      pending.chatId,
+      pending.action,
+      approved
+    );
+
+    await ctx.editMessageText(`${originalText}\n\n${result}`, {
+      reply_markup: undefined,
+    });
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  await ctx.answerCallbackQuery();
+});
 
 // ============================================================
 // START
@@ -487,6 +768,7 @@ console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
 console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
 
 bot.start({
+  allowed_updates: ["message", "callback_query", "message_reaction"],
   onStart: () => {
     console.log("Bot is running!");
   },
