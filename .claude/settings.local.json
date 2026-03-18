@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Edit",
+      "Write",
+      "MultiEdit",
+      "Bash(bun run:*)",
+      "Bash(npm --version)",
+      "Bash(ls c:/dev/github/claude-telegram-relay/*.example)",
+      "Bash(bun install:*)",
+      "Bash(kill 62644)",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(start chrome:*)",
+      "Bash(cmd.exe /c start \"\" \"C:\\\\dev\\\\github\\\\claude-telegram-relay\\\\hello-world\\\\index.html\")",
+      "Bash(powershell.exe -Command \"Start-Process ''C:\\\\dev\\\\github\\\\claude-telegram-relay\\\\hello-world\\\\index.html''\")"
+    ]
+  }
+}

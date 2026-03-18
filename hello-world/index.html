@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hello World</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      gap: 2rem;
+    }
+    h1 {
+      font-size: 3rem;
+      background: linear-gradient(135deg, #6ee7f7, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .compiler {
+      width: 700px;
+      background: #161b22;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.12);
+    }
+    .toolbar {
+      background: #21262d;
+      padding: 0.75rem 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .dot { width: 12px; height: 12px; border-radius: 50%; }
+    .dot.red { background: #ff5f57; }
+    .dot.yellow { background: #febc2e; }
+    .dot.green { background: #28c840; }
+    .lang-select {
+      margin-left: auto;
+      background: #30363d;
+      color: #e6edf3;
+      border: none;
+      padding: 0.25rem 0.5rem;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    #code {
+      width: 100%;
+      height: 200px;
+      background: #0d1117;
+      color: #7ee787;
+      font-family: 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 14px;
+      padding: 1rem;
+      border: none;
+      resize: vertical;
+      outline: none;
+    }
+    .run-bar {
+      padding: 0.75rem 1rem;
+      background: #21262d;
+      display: flex;
+      justify-content: flex-end;
+    }
+    #run-btn {
+      background: linear-gradient(135deg, #6ee7f7, #a78bfa);
+      color: #0d1117;
+      border: none;
+      padding: 0.5rem 1.5rem;
+      border-radius: 8px;
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    #run-btn:hover { opacity: 0.85; }
+    #output {
+      min-height: 80px;
+      padding: 1rem;
+      font-family: monospace;
+      font-size: 14px;
+      color: #79c0ff;
+      background: #010409;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <h1>Hello, World!</h1>
+
+  <div class="compiler">
+    <div class="toolbar">
+      <div class="dot red"></div>
+      <div class="dot yellow"></div>
+      <div class="dot green"></div>
+      <span style="margin-left:0.5rem; font-size:13px; color:#8b949e">compiler.js</span>
+      <select class="lang-select" id="lang">
+        <option value="js">JavaScript</option>
+      </select>
+    </div>
+    <textarea id="code" spellcheck="false">// Write some JavaScript and hit Run
+console.log("Hello, World!");
+
+const greet = name => `Hey ${name}, welcome to your in-browser compiler!`;
+console.log(greet("Kevin"));</textarea>
+    <div class="run-bar">
+      <button id="run-btn">&#9654; Run</button>
+    </div>
+    <div id="output">// Output will appear here...</div>
+  </div>
+
+  <script>
+    document.getElementById('run-btn').addEventListener('click', () => {
+      const code = document.getElementById('code').value;
+      const output = document.getElementById('output');
+      const logs = [];
+
+      const fakeConsole = {
+        log: (...args) => logs.push(args.map(String).join(' ')),
+        error: (...args) => logs.push('ERROR: ' + args.map(String).join(' ')),
+        warn: (...args) => logs.push('WARN: ' + args.map(String).join(' ')),
+      };
+
+      try {
+        const fn = new Function('console', code);
+        fn(fakeConsole);
+        output.style.color = '#0077aa';
+        output.textContent = logs.join('\n') || '(no output)';
+      } catch (e) {
+        output.style.color = '#ff5f57';
+        output.textContent = 'Error: ' + e.message;
+      }
+    });
+  </script>
+</body>
+</html>

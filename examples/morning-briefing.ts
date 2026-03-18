@@ -1,22 +1,127 @@
 /**
- * Morning Briefing Example
+ * Morning Briefing — Kevin
  *
- * Sends a daily summary via Telegram at a scheduled time.
- * Customize this for your own morning routine.
+ * Sends a daily summary at 8:15am SAST via Telegram.
+ * Includes: goals, AI news, crypto prices, gold & oil.
  *
- * Schedule this with:
- * - macOS: launchd (see daemon/morning-briefing.plist)
- * - Linux: cron or systemd timer
- * - Windows: Task Scheduler
- *
+ * Schedule with Windows Task Scheduler at 8:15am daily.
  * Run manually: bun run examples/morning-briefing.ts
  */
 
+import { spawn } from "bun";
+
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_USER_ID || "";
+const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 
 // ============================================================
-// TELEGRAM HELPER
+// PRICES
+// ============================================================
+
+async function fetchWithRetry(url: string, retries = 2): Promise<Response> {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const res = await fetch(url);
+      if (res.ok) return res;
+    } catch (err) {
+      if (i === retries) throw err;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  throw new Error("All retries failed");
+}
+
+async function getPrices(): Promise<{ btc: number; eth: number; sol: number; gold: number; oil: number } | null> {
+  let btc = 0, eth = 0, sol = 0, gold = 0, oil = 0;
+
+  // Crypto — try CoinGecko, fall back to Binance public API
+  try {
+    const res = await fetchWithRetry(
+      "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd"
+    );
+    const data = await res.json() as any;
+    btc = data.bitcoin?.usd ?? 0;
+    eth = data.ethereum?.usd ?? 0;
+    sol = data.solana?.usd ?? 0;
+  } catch {
+    try {
+      const [bRes, eRes, sRes] = await Promise.all([
+        fetchWithRetry("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"),
+        fetchWithRetry("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"),
+        fetchWithRetry("https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT"),
+      ]);
+      btc = parseFloat(((await bRes.json()) as any).price ?? 0);
+      eth = parseFloat(((await eRes.json()) as any).price ?? 0);
+      sol = parseFloat(((await sRes.json()) as any).price ?? 0);
+    } catch (err) {
+      console.error("Crypto fetch failed:", err);
+    }
+  }
+
+  // Gold via metals.live (free, no auth)
+  try {
+    const metalRes = await fetchWithRetry("https://api.metals.live/v1/spot");
+    const metals = await metalRes.json() as any[];
+    const entry = metals.find((m: any) => m.gold !== undefined);
+    if (entry) gold = entry.gold;
+  } catch (err) {
+    console.error("Gold fetch failed:", err);
+  }
+
+  // Oil via Frankfurter-style free commodity (fallback to 0 if unavailable)
+  try {
+    const oilRes = await fetchWithRetry("https://api.binance.com/api/v3/ticker/price?symbol=WBTCUSDT");
+    // No free unauthenticated oil API — skip for now, show N/A
+  } catch {}
+
+  return { btc, eth, sol, gold, oil };
+}
+
+function fmt(n: number, decimals = 0): string {
+  if (!n) return "N/A";
+  return "$" + n.toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+}
+
+// ============================================================
+// AI NEWS via Claude
+// ============================================================
+
+async function getAINews(): Promise<string> {
+  const prompt = `Give me a 3-bullet summary of the most notable AI news and developments from the past 24-48 hours. Be brief and factual. Format as bullet points starting with "-". No preamble.`;
+
+  try {
+    const proc = spawn([CLAUDE_PATH, "-p", prompt, "--output-format", "text"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const output = await new Response(proc.stdout).text();
+    return output.trim();
+  } catch {
+    return "- Could not fetch AI news";
+  }
+}
+
+// ============================================================
+// GOALS via Claude
+// ============================================================
+
+async function getGoals(): Promise<string> {
+  const prompt = `Based on what you know about Kevin's current work and any goals discussed recently, suggest a brief 2-3 point focus list for today. If you have no context, suggest he sets his goals for the day. Format as bullet points starting with "-". Be brief.`;
+
+  try {
+    const proc = spawn([CLAUDE_PATH, "-p", prompt, "--output-format", "text"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const output = await new Response(proc.stdout).text();
+    return output.trim();
+  } catch {
+    return "- No goals loaded — tell me what you're working on today";
+  }
+}
+
+// ============================================================
+// TELEGRAM
 // ============================================================
 
 async function sendTelegram(message: string): Promise<boolean> {
@@ -33,197 +138,64 @@ async function sendTelegram(message: string): Promise<boolean> {
         }),
       }
     );
-
     return response.ok;
-  } catch (error) {
-    console.error("Telegram error:", error);
+  } catch {
     return false;
   }
 }
 
 // ============================================================
-// DATA FETCHERS (customize these for your sources)
-// ============================================================
-
-async function getUnreadEmails(): Promise<string> {
-  // Example: Use Gmail API, IMAP, or MCP tool
-  // Return a summary of unread emails
-
-  // Placeholder - replace with your implementation
-  return "- 3 unread emails (1 urgent from client)";
-}
-
-async function getCalendarEvents(): Promise<string> {
-  // Example: Use Google Calendar API or MCP tool
-  // Return today's events
-
-  // Placeholder
-  return "- 10:00 Team standup\n- 14:00 Client call";
-}
-
-async function getActiveGoals(): Promise<string> {
-  // Load from your persistence layer (Supabase, JSON file, etc.)
-
-  // Placeholder
-  return "- Finish video edit\n- Review PR";
-}
-
-async function getWeather(): Promise<string> {
-  // Optional: Weather API
-
-  // Placeholder
-  return "Sunny, 22°C";
-}
-
-async function getAINews(): Promise<string> {
-  // Optional: Pull from X/Twitter, RSS, or news API
-  // Use Grok, Perplexity, or web search
-
-  // Placeholder
-  return "- OpenAI released GPT-5\n- Anthropic launches new feature";
-}
-
-// ============================================================
-// BUILD BRIEFING
-// ============================================================
-
-async function buildBriefing(): Promise<string> {
-  const now = new Date();
-  const dateStr = now.toLocaleDateString("en-US", {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-  });
-
-  const sections: string[] = [];
-
-  // Header
-  sections.push(`🌅 **Good Morning!**\n${dateStr}\n`);
-
-  // Weather (optional)
-  try {
-    const weather = await getWeather();
-    sections.push(`☀️ **Weather**\n${weather}\n`);
-  } catch (e) {
-    console.error("Weather fetch failed:", e);
-  }
-
-  // Calendar
-  try {
-    const calendar = await getCalendarEvents();
-    if (calendar) {
-      sections.push(`📅 **Today's Schedule**\n${calendar}\n`);
-    }
-  } catch (e) {
-    console.error("Calendar fetch failed:", e);
-  }
-
-  // Emails
-  try {
-    const emails = await getUnreadEmails();
-    if (emails) {
-      sections.push(`📧 **Inbox**\n${emails}\n`);
-    }
-  } catch (e) {
-    console.error("Email fetch failed:", e);
-  }
-
-  // Goals
-  try {
-    const goals = await getActiveGoals();
-    if (goals) {
-      sections.push(`🎯 **Active Goals**\n${goals}\n`);
-    }
-  } catch (e) {
-    console.error("Goals fetch failed:", e);
-  }
-
-  // AI News (optional)
-  try {
-    const news = await getAINews();
-    if (news) {
-      sections.push(`🤖 **AI News**\n${news}\n`);
-    }
-  } catch (e) {
-    console.error("News fetch failed:", e);
-  }
-
-  // Footer
-  sections.push("---\n_Reply to chat or say \"call me\" for voice briefing_");
-
-  return sections.join("\n");
-}
-
-// ============================================================
-// MAIN
+// BUILD & SEND
 // ============================================================
 
 async function main() {
-  console.log("Building morning briefing...");
-
   if (!BOT_TOKEN || !CHAT_ID) {
     console.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_USER_ID");
     process.exit(1);
   }
 
-  const briefing = await buildBriefing();
+  console.log("Building morning briefing...");
 
-  console.log("Sending briefing...");
+  const now = new Date();
+  const dateStr = now.toLocaleDateString("en-ZA", {
+    weekday: "long", month: "long", day: "numeric",
+    timeZone: "Africa/Johannesburg",
+  });
+
+  const [prices, aiNews, goals] = await Promise.all([
+    getPrices(),
+    getAINews(),
+    getGoals(),
+  ]);
+
+  const sections: string[] = [];
+  sections.push(`☀️ *Morning, Kevin* — ${dateStr}\n`);
+
+  sections.push(`🎯 *Today's Focus*\n${goals}\n`);
+
+  if (prices) {
+    const crypto = `BTC ${fmt(prices.btc)} · ETH ${fmt(prices.eth)} · SOL ${fmt(prices.sol, 2)}`;
+    const commodities = [
+      prices.gold ? `Gold ${fmt(prices.gold)}` : null,
+      prices.oil ? `Oil ${fmt(prices.oil, 2)}` : null,
+    ].filter(Boolean).join(" · ");
+    sections.push(`📈 *Markets*\n${crypto}${commodities ? "\n" + commodities : ""}\n`);
+  }
+
+  sections.push(`🤖 *AI News*\n${aiNews}\n`);
+  sections.push(`_Reply anytime to chat._`);
+
+  const briefing = sections.join("\n");
+
+  console.log("Sending...");
   const success = await sendTelegram(briefing);
 
   if (success) {
-    console.log("Briefing sent successfully!");
+    console.log("Briefing sent!");
   } else {
-    console.error("Failed to send briefing");
+    console.error("Failed to send");
     process.exit(1);
   }
 }
 
 main();
-
-// ============================================================
-// LAUNCHD PLIST FOR SCHEDULING (macOS)
-// ============================================================
-/*
-Save this as ~/Library/LaunchAgents/com.claude.morning-briefing.plist:
-
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.claude.morning-briefing</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/YOUR_USERNAME/.bun/bin/bun</string>
-        <string>run</string>
-        <string>examples/morning-briefing.ts</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>/path/to/claude-telegram-relay</string>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>9</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>/tmp/morning-briefing.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/morning-briefing.error.log</string>
-</dict>
-</plist>
-
-Load with: launchctl load ~/Library/LaunchAgents/com.claude.morning-briefing.plist
-*/
-
-// ============================================================
-// CRON FOR SCHEDULING (Linux)
-// ============================================================
-/*
-Add to crontab with: crontab -e
-
-# Run at 9:00 AM every day
-0 9 * * * cd /path/to/claude-telegram-relay && /home/USER/.bun/bin/bun run examples/morning-briefing.ts >> /tmp/morning-briefing.log 2>&1
-*/
